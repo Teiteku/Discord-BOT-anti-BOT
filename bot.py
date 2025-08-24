@@ -1,3 +1,4 @@
+from flask import Flask
 from threading import Thread
 import os, json, time
 import discord
@@ -6,7 +7,15 @@ from discord import app_commands
 from collections import defaultdict,deque
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
+app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+if __name__ == "__main__":
+    # 0.0.0.0 は外部からアクセス可能にするため
+    app.run(host="0.0.0.0", port=8080
 # ------------------------
 # ファイル設定
 # ------------------------
