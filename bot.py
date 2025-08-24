@@ -1,64 +1,125 @@
-import os, time, re
+from threading import Thread
+import os, json, time
 import discord
 from discord.ext import commands
-from collections import deque, defaultdict
-from dotenv import load_dotenv
+from discord import app_commands
+from collections import defaultdict,deque
 
-# ====== 環境変数 ======
-load_dotenv()  # ローカル実行時のみ有効。Renderでは不要だが置いておいてOK
-TOKEN = os.environ.get("DISCORD_TOKEN", "")
-GUILD_ID = int(os.environ.get("GUILD_ID", "0"))  # 即UI表示したいサーバーID。不要なら0
-LOG_CH_ID = int(os.environ.get("MOD_LOG_CHANNEL_ID", "0"))
+TOKEN = os.environ.get("DISCORD_TOKEN")
 
-# ====== Intents ======
+# ------------------------
+# ファイル設定
+# ------------------------
+NG_FILE = "ng_words.json"
+SPAM_FILE = "spam_settings.json"
+LOG_FILE = "log_channel.json"
+PERM_FILE = "ng_perms.json"
+
+def load_json(file, default={}):
+    if os.path.exists(file):
+        with open(file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
+
+def save_json(file, data):
+    with open(file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+guild_ng_words = load_json(NG_FILE, {})
+server_spam_settings = load_json(SPAM_FILE, {})
+log_channels = load_json(LOG_FILE, {})
+ng_permissions = load_json(PERM_FILE, {})
+
+# ------------------------
+# Intents
+# ------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-
-# ====== Bot ======
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ====== 簡易モデレーション設定 ======
-NG_WORDS = {"死ね", "荒らし", "カジノ招待"}  # /setng で追加、/delng で削除、/nglist で確認
-WINDOW_SEC = 6          # 速度スパム検知ウィンドウ（秒）
-MAX_MSG_PER_WIN = 8     # 短時間の最大発言
-MAX_DUPLICATES = 3      # 同一文連投の閾値
-MAX_MENTIONS = 5        # 一度にメンション許容量
-
+# ------------------------
+# スパム管理
+# ------------------------
 user_msgs = defaultdict(lambda: deque())
-user_last_text = defaultdict(lambda: deque(maxlen=MAX_DUPLICATES))
+user_last_text = defaultdict(lambda: deque(maxlen=3))
 
-INVITE_RE = re.compile(r"(?:https?://)?discord(?:\.gg|\.com/invite)/\S+", re.I)
+# ------------------------
+# 警告ログUI
+# ------------------------
+class WarnButtons(discord.ui.View):
+    def __init__(self, target_user: discord.Member):
+        super().__init__(timeout=None)
+        self.target_user = target_user
 
-async def mod_log(guild: discord.Guild, text: str):
-    if LOG_CH_ID:
-        ch = guild.get_channel(LOG_CH_ID)
-        if ch:
-            await ch.send(text)
+    @discord.ui.button(label="確認", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.edit(view=None)
+        await interaction.response.send_message("✅ 確認しました。", ephemeral=True)
 
-# ====== 起動時 ======
+    @discord.ui.button(label="タイムアウト", style=discord.ButtonStyle.secondary)
+    async def timeout_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.edit(view=None)
+        if interaction.user.guild_permissions.moderate_members:
+            await self.target_user.timeout(duration=60)
+            await interaction.response.send_message(f"⏱ {self.target_user} を1分タイムアウトしました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+
+    @discord.ui.button(label="キック", style=discord.ButtonStyle.danger)
+    async def kick_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.edit(view=None)
+        if interaction.user.guild_permissions.kick_members:
+            await self.target_user.kick(reason="警告ログから")
+            await interaction.response.send_message(f"👢 {self.target_user} をキックしました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+
+    @discord.ui.button(label="BAN", style=discord.ButtonStyle.danger)
+    async def ban_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.message.edit(view=None)
+        if interaction.user.guild_permissions.ban_members:
+            await self.target_user.ban(reason="警告ログから")
+            await interaction.response.send_message(f"🔨 {self.target_user} をBANしました。", ephemeral=True)
+        else:
+            await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+
+# ------------------------
+# モデレーションログ送信
+# ------------------------
+async def mod_log(guild: discord.Guild, user: discord.Member, reason: str, content: str):
+    gid = str(guild.id)
+    ch_id = log_channels.get(gid)
+    if not ch_id:
+        return
+    ch = guild.get_channel(int(ch_id))
+    if not isinstance(ch, discord.TextChannel):
+        return
+    embed = discord.Embed(title="⚠️ 警告ログ", color=discord.Color.red(), timestamp=discord.utils.utcnow())
+    embed.add_field(name="ユーザー", value=f"{user} ({user.id})", inline=False)
+    embed.add_field(name="理由", value=reason, inline=False)
+    embed.add_field(name="内容", value=content[:1024] or "なし", inline=False)
+    view = WarnButtons(user)
+    await ch.send(embed=embed, view=view)
+
+# ------------------------
+# ユーティリティ関数
+# ------------------------
+def check_permission(user: discord.Member):
+    if user.guild_permissions.administrator:
+        return True
+    gid = str(user.guild.id)
+    allowed_roles = ng_permissions.get(gid, [])
+    return any(role.id in allowed_roles for role in user.roles)
+
+# ------------------------
+# イベント
+# ------------------------
 @bot.event
 async def on_ready():
-    # スラッシュコマンド同期
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        await bot.tree.sync(guild=guild)   # 指定ギルドに即反映（開発・テスト向け）
-        print(f"✅ Synced commands to guild {GUILD_ID}")
-    else:
-        await bot.tree.sync()               # グローバル同期（最大1時間かかる）
-        print("✅ Synced global commands")
-    print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    await bot.tree.sync()
+    print(f"✅ ログイン: {bot.user}")
 
-# ====== メンバー参加ログ（任意） ======
-@bot.event
-async def on_member_join(member: discord.Member):
-    try:
-        age_days = (discord.utils.utcnow() - member.created_at).days
-        await mod_log(member.guild, f"🕒 新規参加: {member}（作成 {age_days}日）")
-    except Exception:
-        pass
-
-# ====== メッセージ監視（NGワード/スパム） ======
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
@@ -68,121 +129,217 @@ async def on_message(message: discord.Message):
     now = time.time()
     content = message.content or ""
 
-    # NGワード削除
-    if any(w in content for w in NG_WORDS):
+    # NGワード削除（文章に含まれる場合のみ）
+    IGNORE_WORDS = {"しまね"}  # 削除させたくないワード
+    ng_words = set(guild_ng_words.get(str(message.guild.id), []))
+    if any(w in content for w in ng_words if w not in IGNORE_WORDS):
         try:
             await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} 禁止語はNGです。", delete_after=5
-            )
-            await mod_log(message.guild, f"🧹 削除: {message.author} > {content[:80]}")
+            await message.channel.send(f"{message.author.mention} 禁止語です。", delete_after=5)
+            await mod_log(message.guild, message.author, "NGワード使用", content)
         except discord.Forbidden:
             pass
         return
 
-    # メンション過多・@everyone/@here 連投
-    is_everyone = message.mention_everyone
-    mentions_count = len(message.mentions)
-    if is_everyone or mentions_count >= MAX_MENTIONS:
-        dq = user_msgs[str(uid) + "_everyone"]
-        dq.append(now)
-        while dq and now - dq[0] > WINDOW_SEC:
-            dq.popleft()
-        if len(dq) > 2:  # 3回目で削除
-            try:
-                await message.delete()
-                await mod_log(message.guild, f"🚨 @everyone/@here連投: {message.author}")
-            except discord.Forbidden:
-                pass
-            return
+    # ------------------------
+    # スパムチェック（元コードのまま）
+    default_setting = {"window_sec":6, "max_msg":8, "max_duplicates":3, "max_mentions":5}
+    setting = server_spam_settings.get(str(message.guild.id), default_setting)
+    window_sec = setting.get("window_sec",6)
+    max_msg = setting.get("max_msg",8)
+    max_duplicates = setting.get("max_duplicates",3)
+    max_mentions = setting.get("max_mentions",5)
 
-    # 速度スパム
     dq = user_msgs[uid]
     dq.append(now)
-    while dq and now - dq[0] > WINDOW_SEC:
+    while dq and now - dq[0] > window_sec:
         dq.popleft()
-    if len(dq) > MAX_MSG_PER_WIN:
+    if len(dq) > max_msg:
         try:
             await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} 連投は禁止です。", delete_after=5
-            )
-            await mod_log(message.guild, f"🚨 速度スパム: {message.author}")
+            await message.channel.send(f"{message.author.mention} 連投禁止です。", delete_after=5)
+            await mod_log(message.guild, message.author, "速度スパム", content)
         except discord.Forbidden:
             pass
         return
 
-    # 同一文連投
     lastq = user_last_text[uid]
     if lastq and all(x == content for x in lastq):
         try:
             await message.delete()
-            await message.channel.send(
-                f"{message.author.mention} 同じ内容の連投は禁止です。", delete_after=5
-            )
-            await mod_log(message.guild, f"🔁 重複スパム: {message.author}")
+            await message.channel.send(f"{message.author.mention} 同じ内容の連投は禁止です。", delete_after=5)
+            await mod_log(message.guild, message.author, f"{max_duplicates}回同内容連投", content)
         except discord.Forbidden:
             pass
         return
     lastq.append(content)
 
-    # 下のコマンド処理（prefixコマンド用）に渡す
     await bot.process_commands(message)
 
-# ====== スラッシュコマンド群（管理者不要で実行可能） ======
-
-@bot.tree.command(name="ping", description="Botの応答確認")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
-
-@bot.tree.command(name="setng", description="NGワードを追加（スペース区切り）")
-async def setng(interaction: discord.Interaction, words: str):
-    added = {w.strip() for w in words.split() if w.strip()}
-    if not added:
-        await interaction.response.send_message("追加する語がありません。", ephemeral=True)
+# ------------------------
+# /コマンド
+# ------------------------
+@app_commands.command(name="ng追加", description="NGワードを追加（管理者/権限ロール専用）")
+@app_commands.describe(words="スペース区切りで追加")
+async def ng_add(interaction: discord.Interaction, words: str):
+    if not check_permission(interaction.user):
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
         return
-    NG_WORDS.update(added)
-    await interaction.response.send_message(f"NGワード追加: {', '.join(sorted(added))}")
+    gid = str(interaction.guild.id)
+    if gid not in guild_ng_words:
+        guild_ng_words[gid] = []
+    added = [w.strip() for w in words.split() if w.strip()]
+    guild_ng_words[gid].extend(added)
+    save_json(NG_FILE, guild_ng_words)
+    await interaction.response.send_message(f"✅ NG追加: {', '.join(added)}")
 
-@bot.tree.command(name="nglist", description="現在のNGワード一覧を表示")
-async def nglist(interaction: discord.Interaction):
-    if NG_WORDS:
-        await interaction.response.send_message(f"現在のNGワード: {', '.join(sorted(NG_WORDS))}")
+@app_commands.command(name="ng一覧", description="NGワード一覧表示")
+async def ng_list(interaction: discord.Interaction):
+    ngs = guild_ng_words.get(str(interaction.guild.id), [])
+    if ngs:
+        await interaction.response.send_message(f"📜 NGワード: {', '.join(ngs)}")
     else:
-        await interaction.response.send_message("現在、NGワードはありません。")
+        await interaction.response.send_message("ℹ️ NGワードはありません。")
 
-@bot.tree.command(name="delng", description="指定したNGワードを削除（スペース区切り）")
-async def delng(interaction: discord.Interaction, words: str):
-    targets = {w.strip() for w in words.split() if w.strip()}
-    removed = set()
-    for w in list(targets):
-        if w in NG_WORDS:
-            NG_WORDS.remove(w)
-            removed.add(w)
-    if removed:
-        await interaction.response.send_message(f"削除しました: {', '.join(sorted(removed))}")
+@app_commands.command(name="ng削除_ui", description="選択式でNGワードを削除（管理者/権限ロール専用）")
+async def ng_del_ui(interaction: discord.Interaction):
+    if not check_permission(interaction.user):
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
+    ngs = list(guild_ng_words.get(str(interaction.guild.id), []))
+    if not ngs:
+        await interaction.response.send_message("ℹ️ NGワードはありません。")
+        return
+    class Select(discord.ui.Select):
+        def __init__(self):
+            options = [discord.SelectOption(label=w) for w in ngs[:25]]
+            super().__init__(placeholder="削除するNGワードを選択", options=options, min_values=1, max_values=len(options))
+        async def callback(self, interaction2: discord.Interaction):
+            gid = str(interaction2.guild.id)
+            removed = self.values
+            guild_ng_words[gid] = [w for w in guild_ng_words[gid] if w not in removed]
+            save_json(NG_FILE, guild_ng_words)
+            await interaction2.response.send_message(f"🗑 NG削除: {', '.join(removed)}", ephemeral=True)
+    view = discord.ui.View()
+    view.add_item(Select())
+    await interaction.response.send_message("選択して削除してください", view=view, ephemeral=True)
+
+@app_commands.command(name="ng権限設定", description="NG追加削除権限ロール設定（管理者専用）")
+@app_commands.describe(role="権限を与えるロール")
+async def ng_perm(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    if gid not in ng_permissions:
+        ng_permissions[gid] = []
+    if role.id not in ng_permissions[gid]:
+        ng_permissions[gid].append(role.id)
+        save_json(PERM_FILE, ng_permissions)
+        await interaction.response.send_message(f"✅ {role.name} にNG権限を付与しました。")
     else:
-        await interaction.response.send_message("削除できる語がありませんでした。", ephemeral=True)
+        await interaction.response.send_message("ℹ️ すでに権限があります。")
 
-@bot.tree.command(name="mute", description="指定ユーザーをタイムアウト（秒）")
-async def mute(interaction: discord.Interaction, member: discord.Member, seconds: int = 600):
-    # 実行者は権限不要だが、Bot側に「メンバーをタイムアウト」の権限が必要
-    until = discord.utils.utcnow() + discord.timedelta(seconds=max(1, seconds))
-    try:
-        await member.timeout(until, reason=f"Requested by {interaction.user}")
+@app_commands.command(name="ng権限削除", description="NG追加削除権限ロール削除（管理者専用）")
+@app_commands.describe(role="削除する権限ロール")
+async def ng_perm_remove(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    if gid in ng_permissions and role.id in ng_permissions[gid]:
+        ng_permissions[gid].remove(role.id)
+        save_json(PERM_FILE, ng_permissions)
+        await interaction.response.send_message(f"✅ {role.name} のNG権限を削除しました。")
+    else:
+        await interaction.response.send_message("ℹ️ 権限がありません。")
+
+@app_commands.command(name="スパム設定", description="サーバーごとのスパム設定（管理者/権限ロール専用）")
+@app_commands.describe(window_sec="秒", max_msg="連投数", max_duplicates="同一文連投数", max_mentions="メンション数")
+async def spam_setting(interaction: discord.Interaction, window_sec: int=6, max_msg: int=8, max_duplicates: int=3, max_mentions: int=5):
+    if not check_permission(interaction.user):
+        await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
+        return
+    gid = str(interaction.guild.id)
+    server_spam_settings[gid] = {"window_sec":window_sec, "max_msg":max_msg, "max_duplicates":max_duplicates, "max_mentions":max_mentions}
+    save_json(SPAM_FILE, server_spam_settings)
+    await interaction.response.send_message(f"✅ スパム設定を更新しました。\n時間:{window_sec}s, 連投:{max_msg}, 同文:{max_duplicates}, メンション:{max_mentions}")
+
+@app_commands.command(name="ログチャンネル設定", description="モデレーションログ送信チャンネル設定（管理者専用）")
+@app_commands.describe(channel="ログを送るチャンネル")
+async def log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 管理者専用です。", ephemeral=True)
+        return
+    log_channels[str(interaction.guild.id)] = channel.id
+    save_json(LOG_FILE, log_channels)
+    await interaction.response.send_message(f"✅ ログチャンネルを {channel.mention} に設定しました。")
+
+@app_commands.command(name="help", description="コマンド一覧表示")
+async def help_command(interaction: discord.Interaction):
+    txt = """
+**NG管理コマンド**
+/ng追加 [単語] - NG追加
+/ng一覧 - NG一覧
+/ng削除_ui - 選択式NG削除
+/ng権限設定 [ロール] - NG権限ロール付与
+/ng権限削除 [ロール] - NG権限ロール削除
+
+**スパム管理**
+/スパム設定 [秒] [連投] [同文] [メンション] - スパム設定
+
+**ログ管理**
+/ログチャンネル設定 [チャンネル] - モデレーションログ設定
+/help - コマンド一覧
+"""
+    await interaction.response.send_message(txt, ephemeral=True)
+
+# --- 過去メッセージ削除コマンド ---
+@app_commands.guild_only()
+@bot.tree.command(
+    name="clearuser",
+    description="指定ユーザーの過去メッセージを削除します"
+)
+async def clearuser(interaction: discord.Interaction, user: discord.User, limit: int = 100):
+    # 実行者の管理者権限チェック
+    if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message(
-            f"{member.mention} を {seconds} 秒タイムアウトしました。"
-        )
-        await mod_log(interaction.guild, f"⏱️ Timeout: {member} ({seconds}s) by {interaction.user}")
-    except discord.Forbidden:
-        await interaction.response.send_message(
-            "Botにタイムアウト権限がありません。ロール/権限を確認してください。",
+            "⚠️ このコマンドは管理者のみ実行可能です。",
             ephemeral=True
         )
-    except Exception as e:
-        await interaction.response.send_message(f"エラー: {e}", ephemeral=True)
+        return
 
-# ====== 起動 ======
-if not TOKEN:
-    raise SystemExit("DISCORD_TOKEN が未設定です。Renderの Environment Variables に設定してください。")
+    deleted = 0
+    async for m in interaction.channel.history(limit=limit):
+        if m.author.id == user.id:
+            try:
+                await m.delete()
+                deleted += 1
+            except discord.Forbidden:
+                pass
+            except discord.HTTPException:
+                pass
+
+    await interaction.response.send_message(
+        f"🗑️ ユーザー {user.id} のメッセージを {deleted} 件削除しました（削除可能な範囲のみ）。",
+        ephemeral=True
+    )
+
+
+
+# ------------------------
+# コマンド登録
+# ------------------------
+bot.tree.add_command(ng_add)
+bot.tree.add_command(ng_list)
+bot.tree.add_command(ng_del_ui)
+bot.tree.add_command(ng_perm)
+bot.tree.add_command(ng_perm_remove)
+bot.tree.add_command(spam_setting)
+bot.tree.add_command(log_channel)
+bot.tree.add_command(help_command)
+
+# ------------------------
+# BOT起動
+# ------------------------
 bot.run(TOKEN)
