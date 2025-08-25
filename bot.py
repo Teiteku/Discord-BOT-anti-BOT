@@ -341,7 +341,6 @@ bot.tree.add_command(ng_perm_remove)
 bot.tree.add_command(spam_setting)
 bot.tree.add_command(log_channel)
 bot.tree.add_command(help_command)
-bot.tree.add_command(clearuser)
 
 # ------------------------
 # Discord Bot をスレッドで起動
