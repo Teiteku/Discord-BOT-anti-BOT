@@ -1,23 +1,31 @@
-from flask import Flask
+import os
+import json
+import time
 from threading import Thread
-import os, json, time
+from collections import defaultdict, deque
+
+from flask import Flask
 import discord
 from discord.ext import commands
 from discord import app_commands
-from collections import defaultdict,deque
 
+# ------------------------
+# 環境変数
+# ------------------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
+PORT = int(os.environ.get("PORT", 8080))  # Renderで使う場合
+
+# ------------------------
+# Flask 設定
+# ------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is running!"
 
-def run_web():
-# Flaskを並行起動
-Thread(target=run_web).start()
 # ------------------------
-# ファイル設定
+# JSONファイル管理
 # ------------------------
 NG_FILE = "ng_words.json"
 SPAM_FILE = "spam_settings.json"
@@ -40,7 +48,7 @@ log_channels = load_json(LOG_FILE, {})
 ng_permissions = load_json(PERM_FILE, {})
 
 # ------------------------
-# Intents
+# Discord Bot 設定
 # ------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -54,7 +62,17 @@ user_msgs = defaultdict(lambda: deque())
 user_last_text = defaultdict(lambda: deque(maxlen=3))
 
 # ------------------------
-# 警告ログUI
+# 権限チェック
+# ------------------------
+def check_permission(user: discord.Member):
+    if user.guild_permissions.administrator:
+        return True
+    gid = str(user.guild.id)
+    allowed_roles = ng_permissions.get(gid, [])
+    return any(role.id in allowed_roles for role in user.roles)
+
+# ------------------------
+# モデレーションログUI
 # ------------------------
 class WarnButtons(discord.ui.View):
     def __init__(self, target_user: discord.Member):
@@ -62,12 +80,12 @@ class WarnButtons(discord.ui.View):
         self.target_user = target_user
 
     @discord.ui.button(label="確認", style=discord.ButtonStyle.primary)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm(self, interaction, button):
         await interaction.message.edit(view=None)
         await interaction.response.send_message("✅ 確認しました。", ephemeral=True)
 
     @discord.ui.button(label="タイムアウト", style=discord.ButtonStyle.secondary)
-    async def timeout_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def timeout_btn(self, interaction, button):
         await interaction.message.edit(view=None)
         if interaction.user.guild_permissions.moderate_members:
             await self.target_user.timeout(duration=60)
@@ -76,7 +94,7 @@ class WarnButtons(discord.ui.View):
             await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
 
     @discord.ui.button(label="キック", style=discord.ButtonStyle.danger)
-    async def kick_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def kick_btn(self, interaction, button):
         await interaction.message.edit(view=None)
         if interaction.user.guild_permissions.kick_members:
             await self.target_user.kick(reason="警告ログから")
@@ -85,7 +103,7 @@ class WarnButtons(discord.ui.View):
             await interaction.response.send_message("❌ 権限がありません。", ephemeral=True)
 
     @discord.ui.button(label="BAN", style=discord.ButtonStyle.danger)
-    async def ban_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def ban_btn(self, interaction, button):
         await interaction.message.edit(view=None)
         if interaction.user.guild_permissions.ban_members:
             await self.target_user.ban(reason="警告ログから")
@@ -112,16 +130,6 @@ async def mod_log(guild: discord.Guild, user: discord.Member, reason: str, conte
     await ch.send(embed=embed, view=view)
 
 # ------------------------
-# ユーティリティ関数
-# ------------------------
-def check_permission(user: discord.Member):
-    if user.guild_permissions.administrator:
-        return True
-    gid = str(user.guild.id)
-    allowed_roles = ng_permissions.get(gid, [])
-    return any(role.id in allowed_roles for role in user.roles)
-
-# ------------------------
 # イベント
 # ------------------------
 @bot.event
@@ -130,7 +138,7 @@ async def on_ready():
     print(f"✅ ログイン: {bot.user}")
 
 @bot.event
-async def on_message(message: discord.Message):
+async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
@@ -138,8 +146,8 @@ async def on_message(message: discord.Message):
     now = time.time()
     content = message.content or ""
 
-    # NGワード削除（文章に含まれる場合のみ）
-    IGNORE_WORDS = {"しまね"}  # 削除させたくないワード
+    # NGワードチェック
+    IGNORE_WORDS = {"しまね"}
     ng_words = set(guild_ng_words.get(str(message.guild.id), []))
     if any(w in content for w in ng_words if w not in IGNORE_WORDS):
         try:
@@ -150,8 +158,7 @@ async def on_message(message: discord.Message):
             pass
         return
 
-    # ------------------------
-    # スパムチェック（元コードのまま）
+    # スパムチェック
     default_setting = {"window_sec":6, "max_msg":8, "max_duplicates":3, "max_mentions":5}
     setting = server_spam_settings.get(str(message.guild.id), default_setting)
     window_sec = setting.get("window_sec",6)
@@ -186,8 +193,9 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # ------------------------
-# /コマンド
+# /コマンド 全部
 # ------------------------
+# NG追加
 @app_commands.command(name="ng追加", description="NGワードを追加（管理者/権限ロール専用）")
 @app_commands.describe(words="スペース区切りで追加")
 async def ng_add(interaction: discord.Interaction, words: str):
@@ -202,6 +210,7 @@ async def ng_add(interaction: discord.Interaction, words: str):
     save_json(NG_FILE, guild_ng_words)
     await interaction.response.send_message(f"✅ NG追加: {', '.join(added)}")
 
+# NG一覧
 @app_commands.command(name="ng一覧", description="NGワード一覧表示")
 async def ng_list(interaction: discord.Interaction):
     ngs = guild_ng_words.get(str(interaction.guild.id), [])
@@ -210,6 +219,7 @@ async def ng_list(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("ℹ️ NGワードはありません。")
 
+# NG削除UI
 @app_commands.command(name="ng削除_ui", description="選択式でNGワードを削除（管理者/権限ロール専用）")
 async def ng_del_ui(interaction: discord.Interaction):
     if not check_permission(interaction.user):
@@ -233,6 +243,7 @@ async def ng_del_ui(interaction: discord.Interaction):
     view.add_item(Select())
     await interaction.response.send_message("選択して削除してください", view=view, ephemeral=True)
 
+# NG権限設定
 @app_commands.command(name="ng権限設定", description="NG追加削除権限ロール設定（管理者専用）")
 @app_commands.describe(role="権限を与えるロール")
 async def ng_perm(interaction: discord.Interaction, role: discord.Role):
@@ -249,6 +260,7 @@ async def ng_perm(interaction: discord.Interaction, role: discord.Role):
     else:
         await interaction.response.send_message("ℹ️ すでに権限があります。")
 
+# NG権限削除
 @app_commands.command(name="ng権限削除", description="NG追加削除権限ロール削除（管理者専用）")
 @app_commands.describe(role="削除する権限ロール")
 async def ng_perm_remove(interaction: discord.Interaction, role: discord.Role):
@@ -263,6 +275,7 @@ async def ng_perm_remove(interaction: discord.Interaction, role: discord.Role):
     else:
         await interaction.response.send_message("ℹ️ 権限がありません。")
 
+# スパム設定
 @app_commands.command(name="スパム設定", description="サーバーごとのスパム設定（管理者/権限ロール専用）")
 @app_commands.describe(window_sec="秒", max_msg="連投数", max_duplicates="同一文連投数", max_mentions="メンション数")
 async def spam_setting(interaction: discord.Interaction, window_sec: int=6, max_msg: int=8, max_duplicates: int=3, max_mentions: int=5):
@@ -274,6 +287,7 @@ async def spam_setting(interaction: discord.Interaction, window_sec: int=6, max_
     save_json(SPAM_FILE, server_spam_settings)
     await interaction.response.send_message(f"✅ スパム設定を更新しました。\n時間:{window_sec}s, 連投:{max_msg}, 同文:{max_duplicates}, メンション:{max_mentions}")
 
+# ログチャンネル設定
 @app_commands.command(name="ログチャンネル設定", description="モデレーションログ送信チャンネル設定（管理者専用）")
 @app_commands.describe(channel="ログを送るチャンネル")
 async def log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -284,6 +298,7 @@ async def log_channel(interaction: discord.Interaction, channel: discord.TextCha
     save_json(LOG_FILE, log_channels)
     await interaction.response.send_message(f"✅ ログチャンネルを {channel.mention} に設定しました。")
 
+# help
 @app_commands.command(name="help", description="コマンド一覧表示")
 async def help_command(interaction: discord.Interaction):
     txt = """
@@ -303,42 +318,21 @@ async def help_command(interaction: discord.Interaction):
 """
     await interaction.response.send_message(txt, ephemeral=True)
 
-# --- 過去メッセージ削除コマンド ---
+# 過去メッセージ削除
 @app_commands.guild_only()
-@bot.tree.command(
-    name="clearuser",
-    description="指定ユーザーの過去メッセージを削除します"
-)
+@bot.tree.command(name="clearuser", description="指定ユーザーの過去メッセージを削除します")
 async def clearuser(interaction: discord.Interaction, user: discord.User, limit: int = 100):
-    # 実行者の管理者権限チェック
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "⚠️ このコマンドは管理者のみ実行可能です。",
-            ephemeral=True
-        )
+        await interaction.response.send_message("⚠️ このコマンドは管理者のみ実行可能です。", ephemeral=True)
         return
-
     deleted = 0
-    async for m in interaction.channel.history(limit=limit):
-        if m.author.id == user.id:
-            try:
-                await m.delete()
-                deleted += 1
-            except discord.Forbidden:
-                pass
-            except discord.HTTPException:
-                pass
+    async for msg in interaction.channel.history(limit=limit):
+        if msg.author.id == user.id:
+            await msg.delete()
+            deleted += 1
+    await interaction.response.send_message(f"✅ {deleted}件のメッセージを削除しました。")
 
-    await interaction.response.send_message(
-        f"🗑️ ユーザー {user.id} のメッセージを {deleted} 件削除しました（削除可能な範囲のみ）。",
-        ephemeral=True
-    )
-
-
-
-# ------------------------
 # コマンド登録
-# ------------------------
 bot.tree.add_command(ng_add)
 bot.tree.add_command(ng_list)
 bot.tree.add_command(ng_del_ui)
@@ -347,8 +341,17 @@ bot.tree.add_command(ng_perm_remove)
 bot.tree.add_command(spam_setting)
 bot.tree.add_command(log_channel)
 bot.tree.add_command(help_command)
+bot.tree.add_command(clearuser)
 
 # ------------------------
-# BOT起動
+# Discord Bot をスレッドで起動
 # ------------------------
-bot.run(TOKEN)
+def run_discord():
+    bot.run(TOKEN)
+
+# ------------------------
+# Render 用に Flask と Bot 並行起動
+# ------------------------
+if __name__ == "__main__":
+    Thread(target=run_discord).start()
+    app.run(host="0.0.0.0", port=PORT)
