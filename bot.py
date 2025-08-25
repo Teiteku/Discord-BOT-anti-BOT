@@ -13,10 +13,11 @@ app = Flask(__name__)
 def home():
     return "Bot is running!"
 
-if __name__ == "__main__":
-    # 0.0.0.0 は外部からアクセス可能にするため
+def run_web():
     app.run(host="0.0.0.0", port=8080)
-threading.Thread(target=run_web).start()
+
+# Flaskを並行起動
+Thread(target=run_web).start()
 # ------------------------
 # ファイル設定
 # ------------------------
