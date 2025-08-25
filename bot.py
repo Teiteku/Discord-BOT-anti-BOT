@@ -14,8 +14,6 @@ def home():
     return "Bot is running!"
 
 def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
 # Flaskを並行起動
 Thread(target=run_web).start()
 # ------------------------
